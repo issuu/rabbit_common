@@ -10,8 +10,8 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2013 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2014 GoPivotal, Inc.  All rights reserved.
 %%
 
 -module(rabbit_misc).
@@ -21,7 +21,8 @@
 -export([method_record_type/1, polite_pause/0, polite_pause/1]).
 -export([die/1, frame_error/2, amqp_error/4, quit/1,
          protocol_error/3, protocol_error/4, protocol_error/1]).
--export([not_found/1, absent/1, assert_args_equivalence/4]).
+-export([not_found/1, absent/1]).
+-export([type_class/1, assert_args_equivalence/4]).
 -export([dirty_read/1]).
 -export([table_lookup/2, set_table_value/4]).
 -export([r/3, r/2, r_arg/4, rs/1]).
@@ -52,16 +53,15 @@
 -export([parse_arguments/3]).
 -export([all_module_attributes/1, build_acyclic_graph/3]).
 -export([now_ms/0]).
--export([const_ok/0, const/1]).
+-export([const/1]).
 -export([ntoa/1, ntoab/1]).
 -export([is_process_alive/1]).
 -export([pget/2, pget/3, pget_or_die/2, pset/3]).
 -export([format_message_queue/2]).
 -export([append_rpc_all_nodes/4]).
--export([multi_call/2]).
 -export([os_cmd/1]).
 -export([gb_sets_difference/2]).
--export([version/0]).
+-export([version/0, which_applications/0]).
 -export([sequence_error/1]).
 -export([json_encode/1, json_decode/1, json_to_term/1, term_to_json/1]).
 -export([check_expiry/1]).
@@ -69,14 +69,13 @@
 -export([interval_operation/4]).
 -export([ensure_timer/4, stop_timer/2]).
 -export([get_parent/0]).
+-export([store_proc_name/1, store_proc_name/2]).
+-export([moving_average/4]).
 
 %% Horrible macro to use in guards
 -define(IS_BENIGN_EXIT(R),
         R =:= noproc; R =:= noconnection; R =:= nodedown; R =:= normal;
             R =:= shutdown).
-
-%% This is dictated by `erlang:send_after' on which we depend to implement TTL.
--define(MAX_EXPIRY_TIMER, 4294967295).
 
 %%----------------------------------------------------------------------------
 
@@ -120,6 +119,7 @@
         (rabbit_types:amqp_error()) -> channel_or_connection_exit()).
 -spec(not_found/1 :: (rabbit_types:r(atom())) -> rabbit_types:channel_exit()).
 -spec(absent/1 :: (rabbit_types:amqqueue()) -> rabbit_types:channel_exit()).
+-spec(type_class/1 :: (rabbit_framing:amqp_field_type()) -> atom()).
 -spec(assert_args_equivalence/4 :: (rabbit_framing:amqp_table(),
                                     rabbit_framing:amqp_table(),
                                     rabbit_types:r(any()), [binary()]) ->
@@ -142,9 +142,11 @@
                when is_subtype(K, atom())).
 -spec(r_arg/4 ::
         (rabbit_types:vhost() | rabbit_types:r(atom()), K,
-         rabbit_framing:amqp_table(), binary())
-        -> undefined | rabbit_types:r(K)
-               when is_subtype(K, atom())).
+         rabbit_framing:amqp_table(), binary()) ->
+                      undefined |
+                      rabbit_types:error(
+                        {invalid_type, rabbit_framing:amqp_field_type()}) |
+                      rabbit_types:r(K) when is_subtype(K, atom())).
 -spec(rs/1 :: (rabbit_types:r(atom())) -> string()).
 -spec(enable_cover/0 :: () -> ok_or_error()).
 -spec(start_cover/1 :: ([{string(), string()} | string()]) -> 'ok').
@@ -216,7 +218,6 @@
                                                {bad_edge, [digraph:vertex()]}),
                                       digraph:vertex(), digraph:vertex()})).
 -spec(now_ms/0 :: () -> non_neg_integer()).
--spec(const_ok/0 :: () -> 'ok').
 -spec(const/1 :: (A) -> thunk(A)).
 -spec(ntoa/1 :: (inet:ip_address()) -> string()).
 -spec(ntoab/1 :: (inet:ip_address()) -> string()).
@@ -227,11 +228,10 @@
 -spec(pset/3 :: (term(), term(), [term()]) -> term()).
 -spec(format_message_queue/2 :: (any(), priority_queue:q()) -> term()).
 -spec(append_rpc_all_nodes/4 :: ([node()], atom(), atom(), [any()]) -> [any()]).
--spec(multi_call/2 ::
-        ([pid()], any()) -> {[{pid(), any()}], [{pid(), any()}]}).
 -spec(os_cmd/1 :: (string()) -> string()).
 -spec(gb_sets_difference/2 :: (gb_set(), gb_set()) -> gb_set()).
 -spec(version/0 :: () -> string()).
+-spec(which_applications/0 :: () -> [{atom(), string(), string()}]).
 -spec(sequence_error/1 :: ([({'error', any()} | any())])
                        -> {'error', any()} | any()).
 -spec(json_encode/1 :: (any()) -> {'ok', string()} | {'error', any()}).
@@ -246,6 +246,10 @@
 -spec(ensure_timer/4 :: (A, non_neg_integer(), non_neg_integer(), any()) -> A).
 -spec(stop_timer/2 :: (A, non_neg_integer()) -> A).
 -spec(get_parent/0 :: () -> pid()).
+-spec(store_proc_name/2 :: (atom(), rabbit_types:proc_name()) -> ok).
+-spec(store_proc_name/1 :: (rabbit_types:proc_type_and_name()) -> ok).
+-spec(moving_average/4 :: (float(), float(), float(), float() | 'undefined')
+                          -> float()).
 -endif.
 
 %%----------------------------------------------------------------------------
@@ -369,7 +373,8 @@ r_arg(#resource{virtual_host = VHostPath}, Kind, Table, Key) ->
 r_arg(VHostPath, Kind, Table, Key) ->
     case table_lookup(Table, Key) of
         {longstr, NameBin} -> r(VHostPath, Kind, NameBin);
-        undefined          -> undefined
+        undefined          -> undefined;
+        {Type, _}          -> {error, {invalid_type, Type}}
     end.
 
 rs(#resource{virtual_host = VHostPath, kind = Kind, name = Name}) ->
@@ -537,9 +542,11 @@ tcp_name(Prefix, IPAddress, Port)
     list_to_atom(
       format("~w_~s:~w", [Prefix, inet_parse:ntoa(IPAddress), Port])).
 
-format_inet_error(address) -> "cannot connect to host/port";
-format_inet_error(timeout) -> "timed out";
-format_inet_error(Error)   -> inet:format_error(Error).
+format_inet_error(E) -> format("~w (~s)", [E, format_inet_error0(E)]).
+
+format_inet_error0(address) -> "cannot connect to host/port";
+format_inet_error0(timeout) -> "timed out";
+format_inet_error0(Error)   -> inet:format_error(Error).
 
 %% This is a modified version of Luke Gorrie's pmap -
 %% http://lukego.livejournal.com/6753.html - that doesn't care about
@@ -680,7 +687,7 @@ pid_to_string(Pid) when is_pid(Pid) ->
     <<131,103,100,NodeLen:16,NodeBin:NodeLen/binary,Id:32,Ser:32,Cre:8>>
         = term_to_binary(Pid),
     Node = binary_to_term(<<131,100,NodeLen:16,NodeBin:NodeLen/binary>>),
-    format("<~w.~B.~B.~B>", [Node, Cre, Id, Ser]).
+    format("<~s.~B.~B.~B>", [Node, Cre, Id, Ser]).
 
 %% inverse of above
 string_to_pid(Str) ->
@@ -690,13 +697,7 @@ string_to_pid(Str) ->
     case re:run(Str, "^<(.*)\\.(\\d+)\\.(\\d+)\\.(\\d+)>\$",
                 [{capture,all_but_first,list}]) of
         {match, [NodeStr, CreStr, IdStr, SerStr]} ->
-            %% the NodeStr atom might be quoted, so we have to parse
-            %% it rather than doing a simple list_to_atom
-            NodeAtom = case erl_scan:string(NodeStr) of
-                           {ok, [{atom, _, X}], _} -> X;
-                           {error, _, _} -> throw(Err)
-                       end,
-            <<131,NodeEnc/binary>> = term_to_binary(NodeAtom),
+            <<131,NodeEnc/binary>> = term_to_binary(list_to_atom(NodeStr)),
             [Cre, Id, Ser] = lists:map(fun list_to_integer/1,
                                        [CreStr, IdStr, SerStr]),
             binary_to_term(<<131,103,NodeEnc/binary,Id:32,Ser:32,Cre:8>>);
@@ -882,7 +883,6 @@ build_acyclic_graph(VertexFun, EdgeFun, Graph) ->
             {error, Reason}
     end.
 
-const_ok() -> ok.
 const(X) -> fun () -> X end.
 
 %% Format IPv4-mapped IPv6 addresses as IPv4, since they're what we see
@@ -899,13 +899,8 @@ ntoab(IP) ->
         _ -> "[" ++ Str ++ "]"
     end.
 
-is_process_alive(Pid) when node(Pid) =:= node() ->
-    erlang:is_process_alive(Pid);
 is_process_alive(Pid) ->
-    case rpc:call(node(Pid), erlang, is_process_alive, [Pid]) of
-        true -> true;
-        _    -> false
-    end.
+    rpc:call(node(Pid), erlang, is_process_alive, [Pid]) =:= true.
 
 pget(K, P) -> proplists:get_value(K, P).
 pget(K, P, D) -> proplists:get_value(K, P, D).
@@ -946,36 +941,19 @@ append_rpc_all_nodes(Nodes, M, F, A) ->
                       _           -> Res
                   end || Res <- ResL]).
 
-%% A simplified version of gen_server:multi_call/2 with a sane
-%% API. This is not in gen_server2 as there is no useful
-%% infrastructure there to share.
-multi_call(Pids, Req) ->
-    MonitorPids = [start_multi_call(Pid, Req) || Pid <- Pids],
-    receive_multi_call(MonitorPids, [], []).
-
-start_multi_call(Pid, Req) when is_pid(Pid) ->
-    Mref = erlang:monitor(process, Pid),
-    Pid ! {'$gen_call', {self(), Mref}, Req},
-    {Mref, Pid}.
-
-receive_multi_call([], Good, Bad) ->
-    {lists:reverse(Good), lists:reverse(Bad)};
-receive_multi_call([{Mref, Pid} | MonitorPids], Good, Bad) ->
-    receive
-        {Mref, Reply} ->
-            erlang:demonitor(Mref, [flush]),
-            receive_multi_call(MonitorPids, [{Pid, Reply} | Good], Bad);
-        {'DOWN', Mref, _, _, noconnection} ->
-            receive_multi_call(MonitorPids, Good, [{Pid, nodedown} | Bad]);
-        {'DOWN', Mref, _, _, Reason} ->
-            receive_multi_call(MonitorPids, Good, [{Pid, Reason} | Bad])
-    end.
-
 os_cmd(Command) ->
-    Exec = hd(string:tokens(Command, " ")),
-    case os:find_executable(Exec) of
-        false -> throw({command_not_found, Exec});
-        _     -> os:cmd(Command)
+    case os:type() of
+        {win32, _} ->
+            %% Clink workaround; see
+            %% http://code.google.com/p/clink/issues/detail?id=141
+            os:cmd(" " ++ Command);
+        _ ->
+            %% Don't just return "/bin/sh: <cmd>: not found" if not found
+            Exec = hd(string:tokens(Command, " ")),
+            case os:find_executable(Exec) of
+                false -> throw({command_not_found, Exec});
+                _     -> os:cmd(Command)
+            end
     end.
 
 gb_sets_difference(S1, S2) ->
@@ -984,6 +962,16 @@ gb_sets_difference(S1, S2) ->
 version() ->
     {ok, VSN} = application:get_key(rabbit, vsn),
     VSN.
+
+%% application:which_applications(infinity) is dangerous, since it can
+%% cause deadlocks on shutdown. So we have to use a timeout variant,
+%% but w/o creating spurious timeout errors.
+which_applications() ->
+    try
+        application:which_applications()
+    catch
+        exit:{timeout, _} -> []
+    end.
 
 sequence_error([T])                      -> T;
 sequence_error([{error, _} = Error | _]) -> Error;
@@ -1065,6 +1053,28 @@ stop_timer(State, Idx) ->
                          _     -> setelement(Idx, State, undefined)
                      end
     end.
+
+store_proc_name(Type, ProcName) -> store_proc_name({Type, ProcName}).
+store_proc_name(TypeProcName)   -> put(process_name, TypeProcName).
+
+moving_average(_Time, _HalfLife, Next, undefined) ->
+    Next;
+%% We want the Weight to decrease as Time goes up (since Weight is the
+%% weight for the current sample, not the new one), so that the moving
+%% average decays at the same speed regardless of how long the time is
+%% between samplings. So we want Weight = math:exp(Something), where
+%% Something turns out to be negative.
+%%
+%% We want to determine Something here in terms of the Time taken
+%% since the last measurement, and a HalfLife. So we want Weight =
+%% math:exp(Time * Constant / HalfLife). What should Constant be? We
+%% want Weight to be 0.5 when Time = HalfLife.
+%%
+%% Plug those numbers in and you get 0.5 = math:exp(Constant). Take
+%% the log of each side and you get math:log(0.5) = Constant.
+moving_average(Time,  HalfLife,  Next, Current) ->
+    Weight = math:exp(Time * math:log(0.5) / HalfLife),
+    Next * (1 - Weight) + Current * Weight.
 
 %% -------------------------------------------------------------------------
 %% Begin copypasta from gen_server2.erl

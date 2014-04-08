@@ -10,8 +10,8 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2013 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2014 GoPivotal, Inc.  All rights reserved.
 %%
 
 -ifdef(use_specs).
@@ -20,9 +20,10 @@
 -type(args() :: any()).
 -type(members() :: [pid()]).
 
--spec(joined/2          :: (args(), members())            -> callback_result()).
--spec(members_changed/3 :: (args(), members(), members()) -> callback_result()).
--spec(handle_msg/3      :: (args(), pid(), any())         -> callback_result()).
--spec(terminate/2       :: (args(), term())               -> any()).
+-spec(joined/2          :: (args(), members())    -> callback_result()).
+-spec(members_changed/4 :: (args(), members(),
+                            members(), members()) -> callback_result()).
+-spec(handle_msg/3      :: (args(), pid(), any()) -> callback_result()).
+-spec(terminate/2       :: (args(), term())       -> any()).
 
 -endif.
